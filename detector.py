@@ -1,5 +1,7 @@
+
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -7,23 +9,19 @@ import urllib.request
 from datetime import datetime, timezone
 
 BASE_URL = "https://api.5dollarfootballapi.com/v1"
-
-API_KEY = os.environ["ODDS_API_KEY"]
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
 STATE_FILE = "odds_state.json"
 
 DROP_LIMIT = 10.0
 WINDOW_SECONDS = 300
-
-# GitHub Actions runs every 5 minutes.
-# Check only a few matches to limit API usage.
+MIN_WINDOW_SECONDS = 240
+MAX_WINDOW_SECONDS = 360
 MAX_MATCHES = 3
-
-# Retain history for comparisons and alert deduplication.
 HISTORY_RETENTION = 900
 ALERT_COOLDOWN = 1800
+
+API_KEY = os.environ.get("ODDS_API_KEY", "").strip()
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 
 def get_json(url, headers=None, data=None):
@@ -34,8 +32,26 @@ def get_json(url, headers=None, data=None):
         method="POST" if data is not None else "GET",
     )
 
-    with urllib.request.urlopen(request, timeout=25) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = response.read().decode("utf-8")
+            return json.loads(body)
+
+    except urllib.error.HTTPError as error:
+        # Do not print URLs, headers, tokens, or secret values.
+        raise RuntimeError(
+            f"HTTP error {error.code}"
+        ) from None
+
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            f"Network error: {type(error.reason).__name__}"
+        ) from None
+
+    except (TimeoutError, json.JSONDecodeError):
+        raise RuntimeError(
+            "Request timed out or returned invalid JSON"
+        ) from None
 
 
 def api_get(path):
@@ -47,14 +63,20 @@ def api_get(path):
         },
     )
 
-    if not result.get("success"):
-        raise RuntimeError("The odds API returned an unsuccessful response")
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected odds API response")
 
-    return result.get("data")
+    if result.get("success") is False:
+        raise RuntimeError("Odds API returned success=false")
+
+    return result.get("data", result)
 
 
 def send_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{BOT_TOKEN}/sendMessage"
+    )
 
     body = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
@@ -64,16 +86,22 @@ def send_telegram(message):
 
     result = get_json(url, data=body)
 
-    if not result.get("ok"):
+    if not isinstance(result, dict) or not result.get("ok"):
         raise RuntimeError("Telegram rejected the message")
+
+    return True
 
 
 def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as file:
             state = json.load(file)
-            if isinstance(state, dict):
-                return state
+
+        if isinstance(state, dict):
+            state.setdefault("history", {})
+            state.setdefault("alerts", {})
+            return state
+
     except (OSError, json.JSONDecodeError):
         pass
 
@@ -107,9 +135,19 @@ def extract_score(match):
     away = goals.get("away")
 
     if home is None or away is None:
-        return "score indisponible"
+        return "indisponible"
 
     return f"{home}-{away}"
+
+
+def team_name(match, side):
+    teams = match.get("teams") or {}
+    team = teams.get(side) or {}
+
+    if isinstance(team, dict):
+        return team.get("name", side)
+
+    return side
 
 
 def find_goal_market(odds_data):
@@ -117,39 +155,47 @@ def find_goal_market(odds_data):
         return []
 
     bookmakers = odds_data.get("bookmakers", [])
+    if not isinstance(bookmakers, list):
+        return []
 
     results = []
 
     for bookmaker in bookmakers:
-        # The free plan's default bookmaker is Bet365.
+        if not isinstance(bookmaker, dict):
+            continue
+
         if bookmaker.get("slug") != "bet365":
             continue
 
         odds = bookmaker.get("odds") or {}
+        if not isinstance(odds, dict):
+            continue
+
         market = odds.get("goalline") or {}
-        live = market.get("inplay")
+        if isinstance(market, dict):
+            live = market.get("inplay")
 
-        if isinstance(live, dict):
-            results.append({
-                "bookmaker": bookmaker.get("name", "Bet365"),
-                "line": live.get("line"),
-                "over": live.get("over"),
-                "under": live.get("under"),
-            })
+            if isinstance(live, dict):
+                results.append({
+                    "bookmaker": bookmaker.get("name", "Bet365"),
+                    "line": live.get("line"),
+                    "over": live.get("over"),
+                    "under": live.get("under"),
+                })
 
-        # Also inspect the fixed goal-line ladder, when provided.
         fixed = odds.get("goalline_fixed") or {}
-        fixed_live = fixed.get("inplay")
+        if isinstance(fixed, dict):
+            fixed_live = fixed.get("inplay")
 
-        if isinstance(fixed_live, list):
-            for item in fixed_live:
-                if isinstance(item, dict):
-                    results.append({
-                        "bookmaker": bookmaker.get("name", "Bet365"),
-                        "line": item.get("line"),
-                        "over": item.get("over"),
-                        "under": item.get("under"),
-                    })
+            if isinstance(fixed_live, list):
+                for item in fixed_live:
+                    if isinstance(item, dict):
+                        results.append({
+                            "bookmaker": bookmaker.get("name", "Bet365"),
+                            "line": item.get("line"),
+                            "over": item.get("over"),
+                            "under": item.get("under"),
+                        })
 
     return results
 
@@ -167,45 +213,39 @@ def record_price(state, match, bookmaker, line, side, price, now):
 
     history[:] = [
         item for item in history
-        if 0 <= now - item["t"] <= HISTORY_RETENTION
+        if isinstance(item, dict)
+        and isinstance(item.get("t"), (int, float))
+        and isinstance(item.get("p"), (int, float))
+        and 0 <= now - item["t"] <= HISTORY_RETENTION
     ]
 
-    # Select the closest stored price near five minutes ago.
     candidates = [
         item for item in history
-        if 240 <= now - item["t"] <= 360
+        if MIN_WINDOW_SECONDS <= now - item["t"]
+        <= MAX_WINDOW_SECONDS
     ]
-
-    reference = None
 
     if candidates:
         reference = min(
             candidates,
-            key=lambda item: abs((now - item["t"]) - WINDOW_SECONDS),
+            key=lambda item: abs(
+                (now - item["t"]) - WINDOW_SECONDS
+            ),
         )
 
-    if reference:
-        old_price = reference["p"]
+        old_price = float(reference["p"])
         drop = (old_price - price) / old_price * 100
 
         if drop >= DROP_LIMIT:
-            alert_key = (
-                f"{market_key}|{reference['t']}"
-            )
-
+            alert_key = f"{market_key}|{reference['t']}"
             last_alert = state["alerts"].get(market_key, 0)
 
             if (
                 alert_key not in state["alerts"]
                 and now - last_alert >= ALERT_COOLDOWN
             ):
-                teams = match.get("teams") or {}
-                home = (teams.get("home") or {}).get(
-                    "name", "Domicile"
-                )
-                away = (teams.get("away") or {}).get(
-                    "name", "Extérieur"
-                )
+                home = team_name(match, "home")
+                away = team_name(match, "away")
 
                 message = (
                     "⚠️ BAISSE DE COTE DÉTECTÉE\n\n"
@@ -217,46 +257,69 @@ def record_price(state, match, bookmaker, line, side, price, now):
                     f"Cote actuelle : {price:.2f}\n"
                     f"Baisse : {drop:.1f}%\n"
                     "Intervalle : environ 5 minutes\n\n"
-                    "Signal informatif, pas une garantie de gain."
+                    "Signal informatif, sans garantie de gain."
                 )
 
                 send_telegram(message)
                 state["alerts"][alert_key] = now
                 state["alerts"][market_key] = now
-                print(f"Alert sent: {home} - {away}, {side} {line}")
+
+                print(
+                    f"ALERTE ENVOYÉE : {home} - {away}, "
+                    f"{side} {line}, baisse {drop:.1f}%"
+                )
 
     history.append({"t": now, "p": price})
 
 
 def main():
+    if not API_KEY:
+        raise RuntimeError("Secret ODDS_API_KEY absent")
+
+    if not BOT_TOKEN:
+        raise RuntimeError("Secret TELEGRAM_BOT_TOKEN absent")
+
+    if not CHAT_ID:
+        raise RuntimeError("Secret TELEGRAM_CHAT_ID absent")
+
+    print("=== Test de connexion Telegram ===")
+    send_telegram(
+        "✅ Test réussi : le détecteur de cotes "
+        "est connecté à Telegram."
+    )
+    print("Telegram OK : message de test envoyé.")
+
     now = int(time.time())
     state = load_state()
 
-    state.setdefault("history", {})
-    state.setdefault("alerts", {})
-
-    # Remove expired alert deduplication records.
     state["alerts"] = {
         key: timestamp
         for key, timestamp in state["alerts"].items()
         if isinstance(timestamp, (int, float))
-        and now - timestamp <= 86400
+        and 0 <= now - timestamp <= 86400
     }
 
-    data = api_get("/fixtures?status=live&per_page=100")
+    print("=== Recherche des matchs en direct ===")
+
+    data = api_get(
+        "/fixtures?status=live&per_page=100"
+    )
     fixtures = extract_fixtures(data)
+
+    print(f"Matchs en direct reçus : {len(fixtures)}")
 
     checked = 0
     errors = 0
+    prices_found = 0
 
     for match in fixtures:
         if checked >= MAX_MATCHES:
             break
 
-        fixture_id = match.get("id")
-        if fixture_id is None:
+        if not isinstance(match, dict) or match.get("id") is None:
             continue
 
+        fixture_id = match["id"]
         checked += 1
 
         try:
@@ -264,7 +327,6 @@ def main():
                 f"/fixtures/{fixture_id}/odds?market=goalline"
             )
 
-            # Some responses wrap the payload in another data object.
             if (
                 isinstance(odds_data, dict)
                 and isinstance(odds_data.get("data"), dict)
@@ -275,49 +337,53 @@ def main():
 
             for market in markets:
                 line = market.get("line")
-                bookmaker = market["bookmaker"]
-
                 if line is None:
                     continue
 
                 for side in ("over", "under"):
                     try:
-                        price = float(market[side])
+                        price = float(market.get(side))
                     except (TypeError, ValueError):
                         continue
+
+                    prices_found += 1
 
                     record_price(
                         state=state,
                         match=match,
-                        bookmaker=bookmaker,
+                        bookmaker=market["bookmaker"],
                         line=line,
                         side=side,
                         price=price,
                         now=now,
                     )
 
-        except (
-            urllib.error.HTTPError,
-            urllib.error.URLError,
-            TimeoutError,
-            ValueError,
-            RuntimeError,
-        ) as error:
+        except (RuntimeError, ValueError, TypeError) as error:
             errors += 1
-            # Do not print URLs, request headers, or secret values.
             print(
-                f"Could not check fixture {fixture_id}: "
-                f"{type(error).__name__}"
+                f"Match {fixture_id} : "
+                f"{type(error).__name__}: {error}"
             )
 
     save_state(state)
 
     print(
-        f"Finished at {datetime.now(timezone.utc).isoformat()}: "
-        f"{checked} matches checked; {errors} errors."
+        f"Terminé : {checked} matchs vérifiés, "
+        f"{prices_found} cotes lues, {errors} erreurs."
+    )
+    print(
+        "Les alertes de baisse nécessitent un historique "
+        "de prix couvrant environ cinq minutes."
     )
 
 
 if __name__ == "__main__":
-    main()
-                      
+    try:
+        main()
+    except Exception as error:
+        print(
+            f"ERREUR FATALE : {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    
