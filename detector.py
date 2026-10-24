@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -29,16 +30,14 @@ def request_json(url, method="GET", headers=None, data=None):
 
     try:
         with urllib.request.urlopen(request, timeout=25) as response:
-            body = response.read().decode("utf-8")
-            return json.loads(body)
+            return json.loads(response.read().decode("utf-8"))
 
     except urllib.error.HTTPError as error:
         try:
-            body = error.read().decode("utf-8")
-            details = json.loads(body)
+            details = json.loads(error.read().decode("utf-8"))
             message = details.get(
                 "message",
-                details.get("description", body[:300]),
+                details.get("description", "Erreur API"),
             )
         except Exception:
             message = "Réponse d'erreur illisible"
@@ -80,7 +79,6 @@ def send_telegram(message):
     url = (
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     )
-
     payload = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": message,
@@ -117,58 +115,119 @@ def save_state(state):
 
 
 def extract_fixtures(response):
-    """Accepte plusieurs structures de réponse JSON."""
     if not isinstance(response, dict):
-        print("Réponse API inattendue :", type(response).__name__)
         return []
 
     print("Clés principales de la réponse :", list(response.keys()))
 
-    # Formats courants : {"data": [...]} ou {"data": {"fixtures": [...]}}
-    for container in (response, response.get("data")):
-        if isinstance(container, list):
-            return container
+    data = response.get("data", [])
 
-        if isinstance(container, dict):
-            for key in ("fixtures", "data", "results", "items"):
-                value = container.get(key)
-                if isinstance(value, list):
-                    print(f"Matchs trouvés dans la clé : {key}")
-                    return value
+    if isinstance(data, list):
+        print("Matchs trouvés dans la clé : data")
+        return data
+
+    if isinstance(data, dict):
+        print("Clés de data :", list(data.keys()))
+        for key in ("fixtures", "data", "results", "items"):
+            value = data.get(key)
+            if isinstance(value, list):
+                print(f"Matchs trouvés dans la clé : {key}")
+                return value
 
     print(
         "Structure API non reconnue :",
-        json.dumps(response, ensure_ascii=False)[:1500],
+        json.dumps(response, ensure_ascii=False)[:1000],
     )
     return []
 
 
+def get_live_fixtures():
+    print("=== Essai 1 : filtre live ===")
+
+    try:
+        response = api_get("/fixtures?status=live&per_page=500")
+        fixtures = extract_fixtures(response)
+        print("Matchs reçus avec filtre live :", len(fixtures))
+
+        if fixtures:
+            return fixtures
+
+    except Exception as error:
+        print(
+            "Échec du filtre live :",
+            type(error).__name__,
+            str(error),
+        )
+
+    print("=== Essai 2 : récupération sans filtre ===")
+
+    response = api_get("/fixtures?per_page=500")
+    fixtures = extract_fixtures(response)
+    print("Matchs reçus sans filtre :", len(fixtures))
+
+    live_statuses = {
+        "live",
+        "in_play",
+        "inplay",
+        "1h",
+        "2h",
+        "ht",
+        "half_time",
+        "extra_time",
+        "penalties",
+        "playing",
+    }
+
+    live = []
+
+    for fixture in fixtures:
+        status = str(
+            fixture.get("status", "")
+        ).strip().lower().replace(" ", "_")
+
+        status_code = str(
+            fixture.get("status_code", "")
+        ).strip().lower().replace(" ", "_")
+
+        if status in live_statuses or status_code in live_statuses:
+            live.append(fixture)
+
+    print("Matchs identifiés comme en cours :", len(live))
+
+    if not live:
+        print("Aucun statut live reconnu dans la première page.")
+        print("Exemples de statuts reçus :")
+
+        for fixture in fixtures[:10]:
+            print(
+                "ID :", fixture.get("id"),
+                "| Statut :", fixture.get("status"),
+                "| Code :", fixture.get("status_code"),
+                "| Coup d'envoi :", fixture.get("kickoff_utc"),
+            )
+
+    return live
+
+
 def fixture_name(fixture, side):
     teams = fixture.get("teams", {})
+
     if isinstance(teams, dict):
         team = teams.get(side, {})
-        if isinstance(team, dict) and team.get("name"):
-            return str(team["name"])
-
-    # Autre format parfois utilisé par les API
-    value = fixture.get(f"{side}_team")
-    if isinstance(value, dict):
-        return str(value.get("name", side))
-    if isinstance(value, str):
-        return value
+        if isinstance(team, dict):
+            return str(team.get("name", "Équipe inconnue"))
 
     return "Équipe inconnue"
 
 
 def extract_prices(response):
-    """Extrait les cotes Over/Under si elles sont présentes."""
     if not isinstance(response, dict):
         return []
 
     containers = [response]
-    data = response.get("data")
-    if isinstance(data, dict):
-        containers.append(data)
+
+    if isinstance(response.get("data"), dict):
+        containers.append(response["data"])
 
     prices = []
 
@@ -210,13 +269,13 @@ def extract_prices(response):
                             "price": price,
                         })
                 except (TypeError, ValueError):
-                    pass
+                    continue
 
     return prices
 
 
 def main():
-    print("=== Vérification de la configuration ===")
+    print("=== Configuration ===")
     print("Clé API :", "présente" if API_KEY else "MANQUANTE")
     print("Token Telegram :", "présent" if BOT_TOKEN else "MANQUANT")
     print("Chat ID :", "présent" if CHAT_ID else "MANQUANT")
@@ -227,59 +286,43 @@ def main():
     )
     print("Telegram OK : message de test envoyé.")
 
-    print("=== Recherche des matchs en direct ===")
-    response = api_get("/fixtures?status=live&per_page=100")
-    fixtures = extract_fixtures(response)
-
-    print("Matchs en direct reçus :", len(fixtures))
+    fixtures = get_live_fixtures()
+    print("Matchs en direct retenus :", len(fixtures))
 
     if not fixtures:
         print(
-            "Aucun match récupéré. Vérifie ci-dessus les clés et "
-            "la structure de réponse de l'API."
+            "Aucun match en direct trouvé. "
+            "Aucune cote ne sera analysée pendant cette exécution."
         )
-        # Essai complémentaire : récupérer des fixtures sans filtre.
-        print("=== Essai complémentaire sans filtre live ===")
-        try:
-            alternate = api_get("/fixtures?per_page=10")
-            print(
-                "Réponse sans filtre :",
-                json.dumps(alternate, ensure_ascii=False)[:1500],
-            )
-        except Exception as error:
-            print(
-                "Erreur de l'essai complémentaire :",
-                type(error).__name__,
-                str(error),
-            )
+        return
 
     state = load_state()
     now = int(time.time())
     checked = 0
     errors = 0
+    alerts = 0
 
     for fixture in fixtures[:MAX_MATCHES]:
-        fixture_id = fixture.get("id", fixture.get("fixture_id"))
+        fixture_id = fixture.get("id")
 
         if fixture_id is None:
-            print("Match ignoré : identifiant absent")
             continue
 
         home = fixture_name(fixture, "home")
         away = fixture_name(fixture, "away")
+        status = fixture.get("status", "inconnu")
 
         try:
-            odds_response = api_get(
+            response = api_get(
                 f"/fixtures/{fixture_id}/odds"
             )
-            prices = extract_prices(odds_response)
+            prices = extract_prices(response)
             checked += 1
 
-            if not prices:
-                print(
-                    f"Aucune cote Bet365 Over/Under reconnue "
-                    f"pour le match {fixture_id}"
-                )
+            print(
+                f"Match : {home} - {away} | "
+                f"Statut : {status} | Cotes reconnues : {len(prices)}"
+            )
 
             for item in prices:
                 key = (
@@ -300,13 +343,13 @@ def main():
                         drop = (old_price - item["price"]) / old_price
 
                         if (
-                            MIN_HISTORY_SECONDS <= elapsed
-                            <= MAX_HISTORY_SECONDS
+                            MIN_HISTORY_SECONDS <= elapsed <= MAX_HISTORY_SECONDS
                             and drop >= DROP_THRESHOLD
                         ):
-                            message = (
+                            send_telegram(
                                 "📉 BAISSE DE COTE DÉTECTÉE\n\n"
                                 f"Match : {home} - {away}\n"
+                                f"Statut : {status}\n"
                                 f"Marché : Total buts, "
                                 f"{item['side']} {item['line']}\n"
                                 f"Ancienne cote : {old_price:.2f}\n"
@@ -315,10 +358,8 @@ def main():
                                 f"Intervalle : {elapsed} secondes\n\n"
                                 "Vérifie la cote chez ton bookmaker."
                             )
-                            send_telegram(message)
-                            print(
-                                f"Alerte envoyée : {home} - {away}"
-                            )
+                            alerts += 1
+                            print("Alerte Telegram envoyée.")
 
                 state[key] = {
                     "price": item["price"],
@@ -338,6 +379,7 @@ def main():
 
     print("=== Résultat ===")
     print("Matchs avec cotes vérifiés :", checked)
+    print("Alertes envoyées :", alerts)
     print("Erreurs rencontrées :", errors)
     print("Terminé à :", datetime.now(timezone.utc).isoformat())
 
@@ -350,3 +392,4 @@ if __name__ == "__main__":
             f"ERREUR FATALE : {type(error).__name__}: {error}"
         )
         raise SystemExit(1)
+        
