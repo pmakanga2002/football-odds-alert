@@ -30,7 +30,7 @@ jobs:
           restore-keys: |
             odds-state-
 
-            - name: Diagnose and run detector
+      - name: Diagnose and run detector
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -48,6 +48,7 @@ jobs:
           python -m py_compile detector.py
           echo "=== Execution du detecteur ==="
           python -u detector.py
+
       - name: Save odds history
         if: always()
         uses: actions/cache/save@v5
