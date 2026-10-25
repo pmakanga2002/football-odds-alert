@@ -30,7 +30,7 @@ session.headers.update({
 
 
 # =========================
-# API FOOTBALL
+# API
 # =========================
 
 def api_get(path):
@@ -56,14 +56,11 @@ def api_get(path):
         return result.get("data")
 
     except requests.RequestException as error:
-        print(
-            "Erreur API :",
-            type(error).__name__
-        )
+        print("Erreur API :", type(error).__name__)
         return None
 
     except ValueError:
-        print("La réponse API n'est pas un JSON valide.")
+        print("Réponse API JSON invalide.")
         return None
 
 
@@ -72,14 +69,14 @@ def parse_time(value):
         return None
 
     try:
-        result = datetime.fromisoformat(
+        parsed = datetime.fromisoformat(
             str(value).replace("Z", "+00:00")
         )
 
-        if result.tzinfo is None:
-            result = result.replace(tzinfo=timezone.utc)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
 
-        return result.astimezone(timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     except (ValueError, TypeError):
         return None
@@ -113,13 +110,9 @@ def get_candidate_fixtures():
             fixture.get("kickoff_utc")
         )
 
-        # Priorité aux matchs explicitement en direct.
-        is_live = status in ("in_play", "live")
-
-        if is_live:
+        if status in ("in_play", "live"):
             candidates.append((0, fixture))
 
-        # Matchs programmés dans les 8 prochaines heures.
         elif status == "scheduled" and kickoff:
             delta = kickoff - now
 
@@ -215,10 +208,7 @@ def send_telegram(message):
         return True
 
     except (requests.RequestException, ValueError) as error:
-        print(
-            "Erreur Telegram :",
-            type(error).__name__
-        )
+        print("Erreur Telegram :", type(error).__name__)
         return False
 
 
@@ -248,11 +238,9 @@ def get_prices(fixture):
     prices = []
 
     teams = fixture.get("teams") or {}
-
     home = (teams.get("home") or {}).get(
         "name", "Équipe domicile"
     )
-
     away = (teams.get("away") or {}).get(
         "name", "Équipe extérieure"
     )
@@ -274,9 +262,8 @@ def get_prices(fixture):
             if not isinstance(details, dict):
                 continue
 
-            # IMPORTANT :
-            # Ne jamais utiliser opening ou closing
-            # comme substitut à une cote en direct.
+            # Cotes explicitement identifiées comme live.
+            # Ne pas utiliser opening ou closing ici.
             current = details.get("inplay")
 
             if not isinstance(current, dict):
@@ -297,7 +284,9 @@ def get_prices(fixture):
                 if value <= 1.0:
                     continue
 
-                key = "|".join([
+                # Nouvelle version de clé :
+                # ignore les anciennes références historiques.
+                key = "inplay-v2|" + "|".join([
                     str(fixture_id),
                     str(market),
                     str(line),
@@ -317,11 +306,8 @@ def get_prices(fixture):
     if not bookmaker_found:
         print("Bet365 absent pour ce match.")
 
-    if bookmaker_found and not prices:
-        print(
-            "Aucune cote inplay exploitable "
-            "pour ce match."
-        )
+    elif not prices:
+        print("Aucune cote inplay exploitable pour ce match.")
 
     return prices
 
@@ -332,13 +318,12 @@ def get_prices(fixture):
 
 def main():
     if not API_KEY:
-        raise SystemExit(
-            "Erreur : secret ODDS_API_KEY absent."
-        )
+        raise SystemExit("Secret ODDS_API_KEY absent.")
 
     print("=== BET365 ODDS ALERT ===")
     print("Seuil de baisse :", DROP_THRESHOLD, "%")
     print("Maximum de matchs :", MAX_FIXTURES_PER_RUN)
+    print("Historique : inplay-v2")
 
     state = load_state()
     now = time.time()
@@ -361,7 +346,6 @@ def main():
 
         for item in prices:
             observed += 1
-
             key = item["key"]
             old = state.get(key)
 
@@ -375,8 +359,8 @@ def main():
                 except (KeyError, TypeError, ValueError):
                     pass
 
-            # Comparer uniquement deux observations
-            # récentes de la même cote.
+            # Comparaison uniquement avec une observation
+            # récente de la même cote.
             if (
                 previous_price is not None
                 and previous_time is not None
@@ -403,13 +387,14 @@ def main():
                         "pas une garantie de gain."
                     )
 
-            # Actualiser la référence de prix.
+            # Actualiser la référence, même si aucune
+            # alerte n'est déclenchée.
             state[key] = {
                 "price": item["price"],
                 "time": now,
             }
 
-    # Conserver uniquement les références récentes.
+    # Nettoyage de l'historique trop ancien.
     state = {
         key: value
         for key, value in state.items()
@@ -439,4 +424,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+        
