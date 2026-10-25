@@ -17,7 +17,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DROP_THRESHOLD = 0.10
 MIN_HISTORY_SECONDS = 240
 MAX_HISTORY_SECONDS = 420
-MAX_MATCHES = 100
+MAX_MATCHES = 500
 
 
 def request_json(url, method="GET", headers=None, data=None):
@@ -34,17 +34,15 @@ def request_json(url, method="GET", headers=None, data=None):
 
     except urllib.error.HTTPError as error:
         try:
-            details = json.loads(error.read().decode("utf-8"))
-            message = details.get(
+            body = json.loads(error.read().decode("utf-8"))
+            message = body.get("error", {}).get(
                 "message",
-                details.get("description", "Erreur API"),
+                body.get("message", body.get("description", "Erreur API")),
             )
         except Exception:
             message = "Réponse d'erreur illisible"
 
-        raise RuntimeError(
-            f"HTTP {error.code}: {message}"
-        ) from None
+        raise RuntimeError(f"HTTP {error.code}: {message}") from None
 
     except urllib.error.URLError as error:
         raise RuntimeError(
@@ -61,13 +59,21 @@ def api_get(path):
     if not API_KEY:
         raise RuntimeError("Secret ODDS_API_KEY manquant")
 
-    return request_json(
+    result = request_json(
         BASE_URL + path,
         headers={
             "Authorization": f"Bearer {API_KEY}",
             "Accept": "application/json",
         },
     )
+
+    if isinstance(result, dict) and result.get("success") == 0:
+        error = result.get("error", {})
+        raise RuntimeError(
+            error.get("message", "L'API a signalé une erreur")
+        )
+
+    return result
 
 
 def send_telegram(message):
@@ -76,9 +82,8 @@ def send_telegram(message):
             "TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID manquant"
         )
 
-    url = (
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
     payload = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": message,
@@ -114,185 +119,144 @@ def save_state(state):
         json.dump(state, file, ensure_ascii=False, indent=2)
 
 
-def extract_fixtures(response):
-    if not isinstance(response, dict):
-        return []
-
-    print("Clés principales de la réponse :", list(response.keys()))
-
-    data = response.get("data", [])
-
-    if isinstance(data, list):
-        print("Matchs trouvés dans la clé : data")
-        return data
-
-    if isinstance(data, dict):
-        print("Clés de data :", list(data.keys()))
-        for key in ("fixtures", "data", "results", "items"):
-            value = data.get(key)
-            if isinstance(value, list):
-                print(f"Matchs trouvés dans la clé : {key}")
-                return value
-
-    print(
-        "Structure API non reconnue :",
-        json.dumps(response, ensure_ascii=False)[:1000],
-    )
-    return []
-
-
 def get_live_fixtures():
-    print("=== Essai 1 : filtre live ===")
+    print("=== Recherche des matchs en direct ===")
 
-    try:
-        response = api_get("/fixtures?status=live&per_page=500")
-        fixtures = extract_fixtures(response)
-        print("Matchs reçus avec filtre live :", len(fixtures))
+    response = api_get("/fixtures?status=live&per_page=500")
 
-        if fixtures:
-            return fixtures
+    if not isinstance(response, dict):
+        raise RuntimeError("Réponse fixtures invalide")
 
-    except Exception as error:
+    fixtures = response.get("data", [])
+    pagination = response.get("pagination", {})
+
+    if not isinstance(fixtures, list):
+        raise RuntimeError("Le champ data n'est pas une liste")
+
+    print("Pagination :", pagination)
+    print("Matchs reçus par l'API :", len(fixtures))
+
+    # Le filtre status=live doit normalement renvoyer in_play.
+    live = [
+        fixture for fixture in fixtures
+        if isinstance(fixture, dict)
+        and fixture.get("status") == "in_play"
+    ]
+
+    print("Matchs confirmés en direct :", len(live))
+
+    for fixture in live:
         print(
-            "Échec du filtre live :",
-            type(error).__name__,
-            str(error),
+            fixture.get("teams", {}).get("home", {}).get("name", "?"),
+            "-",
+            fixture.get("teams", {}).get("away", {}).get("name", "?"),
+            "| minute/statut :",
+            fixture.get("status_code"),
         )
-
-    print("=== Essai 2 : récupération sans filtre ===")
-
-    response = api_get("/fixtures?per_page=500")
-    fixtures = extract_fixtures(response)
-    print("Matchs reçus sans filtre :", len(fixtures))
-
-    live_statuses = {
-        "live",
-        "in_play",
-        "inplay",
-        "1h",
-        "2h",
-        "ht",
-        "half_time",
-        "extra_time",
-        "penalties",
-        "playing",
-    }
-
-    live = []
-
-    for fixture in fixtures:
-        status = str(
-            fixture.get("status", "")
-        ).strip().lower().replace(" ", "_")
-
-        status_code = str(
-            fixture.get("status_code", "")
-        ).strip().lower().replace(" ", "_")
-
-        if status in live_statuses or status_code in live_statuses:
-            live.append(fixture)
-
-    print("Matchs identifiés comme en cours :", len(live))
-
-    if not live:
-        print("Aucun statut live reconnu dans la première page.")
-        print("Exemples de statuts reçus :")
-
-        for fixture in fixtures[:10]:
-            print(
-                "ID :", fixture.get("id"),
-                "| Statut :", fixture.get("status"),
-                "| Code :", fixture.get("status_code"),
-                "| Coup d'envoi :", fixture.get("kickoff_utc"),
-            )
 
     return live
 
 
 def fixture_name(fixture, side):
     teams = fixture.get("teams", {})
+    team = teams.get(side, {}) if isinstance(teams, dict) else {}
+    return team.get("name", "Équipe inconnue")
 
-    if isinstance(teams, dict):
-        team = teams.get(side, {})
-        if isinstance(team, dict):
-            return str(team.get("name", "Équipe inconnue"))
 
-    return "Équipe inconnue"
+def add_price(prices, market, side, line, value):
+    try:
+        price = float(value)
+        if price > 1:
+            key = f"{market}|{side}|{line}"
+            prices[key] = {
+                "market": market,
+                "side": side,
+                "line": line,
+                "price": price,
+            }
+    except (TypeError, ValueError):
+        pass
 
 
 def extract_prices(response):
+    """Lit les cotes Bet365 du marché goal_line et goal_line_fixed."""
     if not isinstance(response, dict):
         return []
 
-    containers = [response]
+    data = response.get("data", response)
+    if not isinstance(data, dict):
+        return []
 
-    if isinstance(response.get("data"), dict):
-        containers.append(response["data"])
+    bookmakers = data.get("bookmakers", [])
+    if not isinstance(bookmakers, list):
+        return []
 
-    prices = []
+    prices = {}
 
-    for container in containers:
-        bookmakers = container.get("bookmakers", [])
-
-        if not isinstance(bookmakers, list):
+    for bookmaker in bookmakers:
+        slug = str(bookmaker.get("slug", "")).lower()
+        if slug != "bet365":
             continue
 
-        for bookmaker in bookmakers:
-            name = str(
-                bookmaker.get("slug", bookmaker.get("name", ""))
-            ).lower()
+        odds = bookmaker.get("odds", {})
+        if not isinstance(odds, dict):
+            continue
 
-            if "bet365" not in name:
-                continue
+        # Marché classique Over/Under
+        market = odds.get("goal_line", {})
+        if isinstance(market, dict):
+            inplay = market.get("inplay")
 
-            odds = bookmaker.get("odds", {})
-            if not isinstance(odds, dict):
-                continue
+            if isinstance(inplay, dict):
+                line = inplay.get("line")
+                add_price(prices, "goal_line", "over", line,
+                           inplay.get("over"))
+                add_price(prices, "goal_line", "under", line,
+                           inplay.get("under"))
 
-            goal_line = odds.get("goal_line", {})
-            if not isinstance(goal_line, dict):
-                continue
+        # Échelle de lignes fixes : Over/Under 0.5, 1.5, 2.5, etc.
+        fixed = odds.get("goal_line_fixed", [])
 
-            inplay = goal_line.get("inplay", {})
-            if not isinstance(inplay, dict):
-                continue
-
-            line = inplay.get("line")
-
-            for side in ("over", "under"):
-                try:
-                    price = float(inplay.get(side))
-                    if price > 1:
-                        prices.append({
-                            "side": side,
-                            "line": line,
-                            "price": price,
-                        })
-                except (TypeError, ValueError):
+        if isinstance(fixed, list):
+            for entry in fixed:
+                if not isinstance(entry, dict):
                     continue
 
-    return prices
+                line = entry.get("line")
+                inplay = entry.get("inplay")
+
+                if isinstance(inplay, dict):
+                    add_price(prices, "goal_line_fixed", "over",
+                              line, inplay.get("over"))
+                    add_price(prices, "goal_line_fixed", "under",
+                              line, inplay.get("under"))
+
+                # Tolérance aux réponses où les prix sont directement
+                # placés dans chaque élément de la liste.
+                elif isinstance(entry, dict):
+                    add_price(prices, "goal_line_fixed", "over",
+                              line, entry.get("over"))
+                    add_price(prices, "goal_line_fixed", "under",
+                              line, entry.get("under"))
+
+    return list(prices.values())
 
 
 def main():
-    print("=== Configuration ===")
+    print("=== Vérification de la configuration ===")
     print("Clé API :", "présente" if API_KEY else "MANQUANTE")
     print("Token Telegram :", "présent" if BOT_TOKEN else "MANQUANT")
     print("Chat ID :", "présent" if CHAT_ID else "MANQUANT")
 
-    print("=== Test Telegram ===")
-    send_telegram(
-        "✅ Test réussi : le détecteur de cotes est connecté à Telegram."
-    )
-    print("Telegram OK : message de test envoyé.")
+    if not BOT_TOKEN or not CHAT_ID:
+        raise RuntimeError("Configuration Telegram incomplète")
 
     fixtures = get_live_fixtures()
-    print("Matchs en direct retenus :", len(fixtures))
 
     if not fixtures:
         print(
-            "Aucun match en direct trouvé. "
-            "Aucune cote ne sera analysée pendant cette exécution."
+            "Aucun match en direct fourni par l'API. "
+            "Nouvel essai au prochain lancement."
         )
         return
 
@@ -310,23 +274,22 @@ def main():
 
         home = fixture_name(fixture, "home")
         away = fixture_name(fixture, "away")
-        status = fixture.get("status", "inconnu")
+        status_code = fixture.get("status_code", "?")
 
         try:
-            response = api_get(
-                f"/fixtures/{fixture_id}/odds"
-            )
+            response = api_get(f"/fixtures/{fixture_id}/odds")
             prices = extract_prices(response)
             checked += 1
 
             print(
-                f"Match : {home} - {away} | "
-                f"Statut : {status} | Cotes reconnues : {len(prices)}"
+                f"{home} - {away} | Statut {status_code} | "
+                f"Cotes Bet365 reconnues : {len(prices)}"
             )
 
             for item in prices:
                 key = (
-                    f"{fixture_id}|{item['side']}|{item['line']}"
+                    f"{fixture_id}|{item['market']}|"
+                    f"{item['side']}|{item['line']}"
                 )
                 previous = state.get(key)
 
@@ -343,24 +306,28 @@ def main():
                         drop = (old_price - item["price"]) / old_price
 
                         if (
-                            MIN_HISTORY_SECONDS <= elapsed <= MAX_HISTORY_SECONDS
+                            MIN_HISTORY_SECONDS <= elapsed
+                            <= MAX_HISTORY_SECONDS
                             and drop >= DROP_THRESHOLD
                         ):
-                            send_telegram(
+                            message = (
                                 "📉 BAISSE DE COTE DÉTECTÉE\n\n"
                                 f"Match : {home} - {away}\n"
-                                f"Statut : {status}\n"
-                                f"Marché : Total buts, "
-                                f"{item['side']} {item['line']}\n"
+                                f"Statut : {status_code}\n"
+                                f"Marché : {item['market']}\n"
+                                f"Choix : {item['side']} {item['line']}\n"
                                 f"Ancienne cote : {old_price:.2f}\n"
                                 f"Nouvelle cote : {item['price']:.2f}\n"
                                 f"Baisse : {drop * 100:.1f}%\n"
                                 f"Intervalle : {elapsed} secondes\n\n"
-                                "Vérifie la cote chez ton bookmaker."
+                                "Vérifie la cote actuelle chez le bookmaker."
                             )
+
+                            send_telegram(message)
                             alerts += 1
                             print("Alerte Telegram envoyée.")
 
+                # Enregistre le dernier prix observé.
                 state[key] = {
                     "price": item["price"],
                     "time": now,
@@ -392,4 +359,4 @@ if __name__ == "__main__":
             f"ERREUR FATALE : {type(error).__name__}: {error}"
         )
         raise SystemExit(1)
-        
+    
