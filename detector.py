@@ -1,362 +1,180 @@
 
 import os
-import json
-import time
-import urllib.request
-import urllib.error
-import urllib.parse
-from datetime import datetime, timezone
+import sys
+import requests
+from collections import Counter
+from urllib.parse import urljoin
 
-BASE_URL = "https://api.5dollarfootballapi.com/v1"
-STATE_FILE = "odds_state.json"
-
-API_KEY = os.getenv("ODDS_API_KEY", "").strip()
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-DROP_THRESHOLD = 0.10
-MIN_HISTORY_SECONDS = 240
-MAX_HISTORY_SECONDS = 420
-MAX_MATCHES = 500
-
-
-def request_json(url, method="GET", headers=None, data=None):
-    request = urllib.request.Request(
-        url,
-        headers=headers or {},
-        data=data,
-        method=method,
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=25) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    except urllib.error.HTTPError as error:
-        try:
-            body = json.loads(error.read().decode("utf-8"))
-            message = body.get("error", {}).get(
-                "message",
-                body.get("message", body.get("description", "Erreur API")),
-            )
-        except Exception:
-            message = "Réponse d'erreur illisible"
-
-        raise RuntimeError(f"HTTP {error.code}: {message}") from None
-
-    except urllib.error.URLError as error:
-        raise RuntimeError(
-            f"Erreur réseau : {type(error.reason).__name__}"
-        ) from None
-
-    except (TimeoutError, json.JSONDecodeError):
-        raise RuntimeError(
-            "Délai dépassé ou réponse JSON invalide"
-        ) from None
+API_BASE_URL = "https://api.5dollarfootballapi.com/v1"
+TIMEOUT = 20
 
 
 def api_get(path):
-    if not API_KEY:
-        raise RuntimeError("Secret ODDS_API_KEY manquant")
+    """Appelle l'API sans afficher la clé secrète."""
+    api_key = os.getenv("ODDS_API_KEY", "").strip()
 
-    result = request_json(
-        BASE_URL + path,
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Accept": "application/json",
-        },
-    )
-
-    if isinstance(result, dict) and result.get("success") == 0:
-        error = result.get("error", {})
+    if not api_key:
         raise RuntimeError(
-            error.get("message", "L'API a signalé une erreur")
+            "Le secret GitHub ODDS_API_KEY est absent ou vide."
         )
 
-    return result
+    url = urljoin(API_BASE_URL.rstrip("/") + "/", path.lstrip("/"))
 
-
-def send_telegram(message):
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID manquant"
-        )
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-    payload = urllib.parse.urlencode({
-        "chat_id": CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": "true",
-    }).encode("utf-8")
-
-    result = request_json(
+    # On teste les en-têtes d'authentification courants sans révéler la clé.
+    response = requests.get(
         url,
-        method="POST",
         headers={
-            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Bearer {api_key}",
+            "x-api-key": api_key,
+            "Accept": "application/json",
+            "User-Agent": "Football-Odds-Alert/1.0",
         },
-        data=payload,
+        timeout=TIMEOUT,
     )
 
-    if not result.get("ok"):
-        raise RuntimeError(
-            result.get("description", "Erreur Telegram")
-        )
+    if response.status_code >= 400:
+        print(f"Erreur API HTTP {response.status_code} sur {path}")
+        print("Réponse :", response.text[:500])
+        response.raise_for_status()
+
+    return response.json()
 
 
-def load_state():
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as file:
-            result = json.load(file)
-            return result if isinstance(result, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+def get_fixtures(path):
+    """Récupère les matchs et vérifie la structure de la réponse."""
+    result = api_get(path)
 
+    if not isinstance(result, dict):
+        print("Réponse inattendue :", type(result).__name__)
+        return []
 
-def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as file:
-        json.dump(state, file, ensure_ascii=False, indent=2)
-
-
-def get_live_fixtures():
-    print("=== Recherche des matchs en direct ===")
-
-    response = api_get("/fixtures?status=live&per_page=500")
-
-    if not isinstance(response, dict):
-        raise RuntimeError("Réponse fixtures invalide")
-
-    fixtures = response.get("data", [])
-    pagination = response.get("pagination", {})
+    fixtures = result.get("data", [])
+    pagination = result.get("pagination", {})
 
     if not isinstance(fixtures, list):
-        raise RuntimeError("Le champ data n'est pas une liste")
+        print("Le champ data n'est pas une liste.")
+        return []
 
+    print("Nombre de résultats :", len(fixtures))
     print("Pagination :", pagination)
-    print("Matchs reçus par l'API :", len(fixtures))
 
-    # Le filtre status=live doit normalement renvoyer in_play.
-    live = [
-        fixture for fixture in fixtures
+    statuses = Counter(
+        str(fixture.get("status", "absent"))
+        for fixture in fixtures
         if isinstance(fixture, dict)
-        and fixture.get("status") == "in_play"
-    ]
+    )
+    status_codes = Counter(
+        str(fixture.get("status_code", "absent"))
+        for fixture in fixtures
+        if isinstance(fixture, dict)
+    )
 
-    print("Matchs confirmés en direct :", len(live))
+    print("Statuts trouvés :", dict(statuses))
+    print("Codes de statut :", dict(status_codes))
 
-    for fixture in live:
+    for fixture in fixtures[:5]:
+        if not isinstance(fixture, dict):
+            continue
+
+        home = fixture.get("home_team") or fixture.get("home") or {}
+        away = fixture.get("away_team") or fixture.get("away") or {}
+
+        if isinstance(home, dict):
+            home = home.get("name", str(home))
+        if isinstance(away, dict):
+            away = away.get("name", str(away))
+
         print(
-            fixture.get("teams", {}).get("home", {}).get("name", "?"),
-            "-",
-            fixture.get("teams", {}).get("away", {}).get("name", "?"),
-            "| minute/statut :",
-            fixture.get("status_code"),
+            "Exemple :",
+            f"id={fixture.get('id')}",
+            f"{home} - {away}",
+            f"status={fixture.get('status')}",
+            f"status_code={fixture.get('status_code')}",
         )
 
-    return live
-
-
-def fixture_name(fixture, side):
-    teams = fixture.get("teams", {})
-    team = teams.get(side, {}) if isinstance(teams, dict) else {}
-    return team.get("name", "Équipe inconnue")
-
-
-def add_price(prices, market, side, line, value):
-    try:
-        price = float(value)
-        if price > 1:
-            key = f"{market}|{side}|{line}"
-            prices[key] = {
-                "market": market,
-                "side": side,
-                "line": line,
-                "price": price,
-            }
-    except (TypeError, ValueError):
-        pass
-
-
-def extract_prices(response):
-    """Lit les cotes Bet365 du marché goal_line et goal_line_fixed."""
-    if not isinstance(response, dict):
-        return []
-
-    data = response.get("data", response)
-    if not isinstance(data, dict):
-        return []
-
-    bookmakers = data.get("bookmakers", [])
-    if not isinstance(bookmakers, list):
-        return []
-
-    prices = {}
-
-    for bookmaker in bookmakers:
-        slug = str(bookmaker.get("slug", "")).lower()
-        if slug != "bet365":
-            continue
-
-        odds = bookmaker.get("odds", {})
-        if not isinstance(odds, dict):
-            continue
-
-        # Marché classique Over/Under
-        market = odds.get("goal_line", {})
-        if isinstance(market, dict):
-            inplay = market.get("inplay")
-
-            if isinstance(inplay, dict):
-                line = inplay.get("line")
-                add_price(prices, "goal_line", "over", line,
-                           inplay.get("over"))
-                add_price(prices, "goal_line", "under", line,
-                           inplay.get("under"))
-
-        # Échelle de lignes fixes : Over/Under 0.5, 1.5, 2.5, etc.
-        fixed = odds.get("goal_line_fixed", [])
-
-        if isinstance(fixed, list):
-            for entry in fixed:
-                if not isinstance(entry, dict):
-                    continue
-
-                line = entry.get("line")
-                inplay = entry.get("inplay")
-
-                if isinstance(inplay, dict):
-                    add_price(prices, "goal_line_fixed", "over",
-                              line, inplay.get("over"))
-                    add_price(prices, "goal_line_fixed", "under",
-                              line, inplay.get("under"))
-
-                # Tolérance aux réponses où les prix sont directement
-                # placés dans chaque élément de la liste.
-                elif isinstance(entry, dict):
-                    add_price(prices, "goal_line_fixed", "over",
-                              line, entry.get("over"))
-                    add_price(prices, "goal_line_fixed", "under",
-                              line, entry.get("under"))
-
-    return list(prices.values())
+    return fixtures
 
 
 def main():
-    print("=== Vérification de la configuration ===")
-    print("Clé API :", "présente" if API_KEY else "MANQUANTE")
-    print("Token Telegram :", "présent" if BOT_TOKEN else "MANQUANT")
-    print("Chat ID :", "présent" if CHAT_ID else "MANQUANT")
+    print("========================================")
+    print(" FOOTBALL ODDS ALERT - DIAGNOSTIC API")
+    print("========================================")
 
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Configuration Telegram incomplète")
+    print("Clé API configurée :", bool(os.getenv("ODDS_API_KEY")))
+    print("Jeton Telegram configuré :", bool(
+        os.getenv("TELEGRAM_BOT_TOKEN")
+    ))
+    print("Identifiant Telegram configuré :", bool(
+        os.getenv("TELEGRAM_CHAT_ID")
+    ))
 
-    fixtures = get_live_fixtures()
+    tests = [
+        "/fixtures?status=live&per_page=100",
+        "/fixtures?status=in_play&per_page=100",
+        "/fixtures?status=playing&per_page=100",
+        "/fixtures?per_page=100",
+    ]
 
-    if not fixtures:
-        print(
-            "Aucun match en direct fourni par l'API. "
-            "Nouvel essai au prochain lancement."
-        )
-        return
+    seen = {}
 
-    state = load_state()
-    now = int(time.time())
-    checked = 0
-    errors = 0
-    alerts = 0
-
-    for fixture in fixtures[:MAX_MATCHES]:
-        fixture_id = fixture.get("id")
-
-        if fixture_id is None:
-            continue
-
-        home = fixture_name(fixture, "home")
-        away = fixture_name(fixture, "away")
-        status_code = fixture.get("status_code", "?")
+    for path in tests:
+        print("\n----------------------------------------")
+        print("TEST :", path)
+        print("----------------------------------------")
 
         try:
-            response = api_get(f"/fixtures/{fixture_id}/odds")
-            prices = extract_prices(response)
-            checked += 1
+            fixtures = get_fixtures(path)
 
-            print(
-                f"{home} - {away} | Statut {status_code} | "
-                f"Cotes Bet365 reconnues : {len(prices)}"
-            )
+            for fixture in fixtures:
+                if isinstance(fixture, dict) and fixture.get("id") is not None:
+                    seen[str(fixture["id"])] = fixture
 
-            for item in prices:
-                key = (
-                    f"{fixture_id}|{item['market']}|"
-                    f"{item['side']}|{item['line']}"
-                )
-                previous = state.get(key)
+        except requests.RequestException as error:
+            print("Erreur réseau/API :", str(error))
+        except (ValueError, RuntimeError) as error:
+            print("Erreur :", str(error))
 
-                if isinstance(previous, dict):
-                    old_price = previous.get("price")
-                    old_time = previous.get("time")
+    live_statuses = {
+        "in_play",
+        "live",
+        "inplay",
+        "playing",
+        "1h",
+        "2h",
+        "ht",
+        "half_time",
+        "extra_time",
+        "penalties",
+    }
 
-                    if (
-                        isinstance(old_price, (int, float))
-                        and isinstance(old_time, int)
-                        and old_price > 0
-                    ):
-                        elapsed = now - old_time
-                        drop = (old_price - item["price"]) / old_price
+    live = []
+    for fixture in seen.values():
+        status = str(fixture.get("status", "")).strip().lower()
+        status = status.replace(" ", "_").replace("-", "_")
 
-                        if (
-                            MIN_HISTORY_SECONDS <= elapsed
-                            <= MAX_HISTORY_SECONDS
-                            and drop >= DROP_THRESHOLD
-                        ):
-                            message = (
-                                "📉 BAISSE DE COTE DÉTECTÉE\n\n"
-                                f"Match : {home} - {away}\n"
-                                f"Statut : {status_code}\n"
-                                f"Marché : {item['market']}\n"
-                                f"Choix : {item['side']} {item['line']}\n"
-                                f"Ancienne cote : {old_price:.2f}\n"
-                                f"Nouvelle cote : {item['price']:.2f}\n"
-                                f"Baisse : {drop * 100:.1f}%\n"
-                                f"Intervalle : {elapsed} secondes\n\n"
-                                "Vérifie la cote actuelle chez le bookmaker."
-                            )
+        if status in live_statuses:
+            live.append(fixture)
 
-                            send_telegram(message)
-                            alerts += 1
-                            print("Alerte Telegram envoyée.")
+    print("\n========================================")
+    print(" BILAN DU DIAGNOSTIC")
+    print("========================================")
+    print("Matchs distincts récupérés :", len(seen))
+    print("Matchs avec statut live reconnu :", len(live))
 
-                # Enregistre le dernier prix observé.
-                state[key] = {
-                    "price": item["price"],
-                    "time": now,
-                }
+    if seen:
+        print("Répartition finale des statuts :")
+        print(dict(Counter(
+            str(f.get("status", "absent"))
+            for f in seen.values()
+        )))
 
-        except Exception as error:
-            errors += 1
-            print(
-                f"Erreur match {fixture_id}: "
-                f"{type(error).__name__}: {error}"
-            )
-
-        time.sleep(0.1)
-
-    save_state(state)
-
-    print("=== Résultat ===")
-    print("Matchs avec cotes vérifiés :", checked)
-    print("Alertes envoyées :", alerts)
-    print("Erreurs rencontrées :", errors)
-    print("Terminé à :", datetime.now(timezone.utc).isoformat())
+    print("\nDiagnostic terminé.")
+    print("Aucune alerte de pari n'a été envoyée.")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        print(
-            f"ERREUR FATALE : {type(error).__name__}: {error}"
-        )
-        raise SystemExit(1)
-    
+        print("ERREUR FATALE :", type(error).__name__, str(error))
+        sys.exit(1)
