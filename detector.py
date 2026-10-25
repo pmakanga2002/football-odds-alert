@@ -1,48 +1,68 @@
 
 import os
+import sys
 import requests
 
 BASE = "https://api.5dollarfootballapi.com/v1"
 KEY = os.getenv("ODDS_API_KEY", "").strip()
-FIXTURE_ID = 3715878313
 
 if not KEY:
-    raise SystemExit("Secret ODDS_API_KEY absent.")
+    sys.exit("ERREUR : secret ODDS_API_KEY absent.")
 
-session = requests.Session()
-session.headers.update({
+headers = {
     "Authorization": f"Bearer {KEY}",
     "Accept": "application/json",
-})
+}
 
-# On teste uniquement la route de cotes déjà connue,
-# puis on affiche les noms des champs disponibles.
-url = f"{BASE}/fixtures/{FIXTURE_ID}/odds"
-response = session.get(url, timeout=20)
-print("HTTP :", response.status_code)
-response.raise_for_status()
+def test_endpoint(path):
+    print(f"\n=== TEST {path} ===")
+    try:
+        r = requests.get(BASE + path, headers=headers, timeout=20)
+        print("HTTP :", r.status_code)
 
-result = response.json()
-data = result.get("data", {})
+        try:
+            result = r.json()
+        except ValueError:
+            print("Réponse non JSON.")
+            return
 
-print("Clés de la réponse :", list(result.keys()))
-print("Type de data :", type(data).__name__)
+        if r.status_code != 200:
+            error = result.get("error", {})
+            if isinstance(error, dict):
+                print("Code erreur :", error.get("code", "non précisé"))
+                print("Message :", error.get("message", "non précisé"))
+            else:
+                print("Erreur API :", str(error)[:200])
+            return
 
-if isinstance(data, dict):
-    for key, value in data.items():
-        if key == "bookmakers" and isinstance(value, list):
-            print("Nombre de bookmakers :", len(value))
-            for bookmaker in value:
-                if isinstance(bookmaker, dict):
-                    print("Bookmaker :", bookmaker.get("name"))
-                    odds = bookmaker.get("odds", {})
-                    if isinstance(odds, dict):
-                        for market, details in odds.items():
-                            print("Marché :", market)
-                            if isinstance(details, dict):
-                                print("Champs :", list(details.keys()))
+        data = result.get("data", [])
+
+        if path == "/status":
+            print("Forfait :", data.get("plan", "non indiqué"))
+            usage = data.get("usage", {})
+            limits = data.get("limits", {})
+            print("Utilisation actuelle :", usage.get("today", "non indiquée"))
+            print("Limite :", limits.get("rate_limit", "non indiquée"))
+            return
+
+        if isinstance(data, list):
+            print("Nombre de bookmakers :", len(data))
+            for item in data:
+                if isinstance(item, dict):
+                    print(
+                        "-",
+                        item.get("name", "?"),
+                        "| slug :",
+                        item.get("slug", "?")
+                    )
         else:
-            print("Champ :", key, "| Type :", type(value).__name__)
+            print("Format inattendu :", type(data).__name__)
 
-print("Diagnostic terminé.")
-            
+    except requests.RequestException as e:
+        print("Erreur réseau :", type(e).__name__)
+
+test_endpoint("/status")
+test_endpoint("/bookmakers")
+
+print("\n=== FIN DU TEST ===")
+        
