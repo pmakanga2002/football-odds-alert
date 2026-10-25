@@ -2,176 +2,110 @@
 import os
 import sys
 import requests
-from collections import Counter
 
 API_BASE_URL = "https://api.5dollarfootballapi.com/v1"
 TIMEOUT = 20
 
 
 def api_get(path):
-    api_key = os.getenv("ODDS_API_KEY", "").strip()
-
-    if not api_key:
+    key = os.getenv("ODDS_API_KEY", "").strip()
+    if not key:
         raise RuntimeError("Le secret ODDS_API_KEY est absent.")
 
     response = requests.get(
         API_BASE_URL + path,
         headers={
-            "Authorization": f"Bearer {api_key}",
-            "X-API-Key": api_key,
+            "Authorization": f"Bearer {key}",
             "Accept": "application/json",
         },
         timeout=TIMEOUT,
     )
 
     print(f"HTTP {response.status_code} - {path}")
-
-    if response.status_code >= 400:
-        print("Réponse API :", response.text[:600])
-        response.raise_for_status()
-
+    response.raise_for_status()
     return response.json()
 
 
-def extract_list(result):
-    if not isinstance(result, dict):
-        print("Format inattendu :", type(result).__name__)
-        return []
-
+def get_fixtures(status):
+    result = api_get(f"/fixtures?status={status}&per_page=100")
     data = result.get("data", [])
-
-    if isinstance(data, list):
-        return data
-
-    if isinstance(data, dict):
-        # Certaines routes peuvent renvoyer un objet contenant
-        # une liste de données ou les détails d'un compte.
-        print("Le champ data est un objet.")
-        print("Clés de data :", list(data.keys()))
-        return []
-
-    print("Type du champ data :", type(data).__name__)
-    return []
-
-
-def show_fixtures(path):
-    print("\n" + "=" * 50)
-    print("REQUÊTE :", path)
-    print("=" * 50)
-
-    result = api_get(path)
-
-    if isinstance(result, dict):
-        print("Succès API :", result.get("success"))
-        print("Pagination :", result.get("pagination"))
-
-    fixtures = extract_list(result)
-    print("Nombre de matchs :", len(fixtures))
-
-    statuses = Counter()
-    status_codes = Counter()
-
-    for fixture in fixtures:
-        if not isinstance(fixture, dict):
-            continue
-
-        statuses[str(fixture.get("status", "absent"))] += 1
-        status_codes[str(fixture.get("status_code", "absent"))] += 1
-
-    print("Répartition des statuts :", dict(statuses))
-    print("Répartition des codes :", dict(status_codes))
-
-    for fixture in fixtures[:5]:
-        if not isinstance(fixture, dict):
-            continue
-
-        teams = fixture.get("teams") or {}
-        home = teams.get("home", {}) if isinstance(teams, dict) else {}
-        away = teams.get("away", {}) if isinstance(teams, dict) else {}
-        league = fixture.get("league") or {}
-
-        if not isinstance(home, dict):
-            home = {}
-        if not isinstance(away, dict):
-            away = {}
-        if not isinstance(league, dict):
-            league = {}
-
-        print(
-            "Match :",
-            home.get("name", "?"),
-            "-",
-            away.get("name", "?"),
-            "| Ligue :", league.get("name", "?"),
-            "| Coup d'envoi UTC :", fixture.get("kickoff_utc", "?"),
-            "| Statut :", fixture.get("status", "?"),
-            "| Code :", fixture.get("status_code", "?"),
-            "| ID :", fixture.get("id", "?"),
-        )
-
-    return fixtures
+    return data if isinstance(data, list) else []
 
 
 def main():
-    print("FOOTBALL ODDS ALERT - DIAGNOSTIC COMPLET")
+    print("=== TEST DE RECUPERATION DES COTES ===")
     print("Clé API configurée :", bool(os.getenv("ODDS_API_KEY")))
-    print("Telegram configuré :", bool(
-        os.getenv("TELEGRAM_BOT_TOKEN")
-        and os.getenv("TELEGRAM_CHAT_ID")
-    ))
 
-    try:
-        print("\n=== ÉTAT DU SERVICE ET DU COMPTE ===")
-        status_result = api_get("/status")
-        if isinstance(status_result, dict):
-            # Ne jamais afficher d'éventuelles données d'authentification.
-            print("Clés de réponse :", list(status_result.keys()))
-            print("Réponse de statut :", str(status_result)[:1500])
+    live = get_fixtures("live")
+    print("Matchs en direct :", len(live))
 
-    except Exception as error:
-        print("Impossible de lire /status :",
-              type(error).__name__, str(error))
+    fixture = None
 
-    results = {}
+    if live:
+        fixture = live[0]
+        print("Test des cotes sur un match en direct.")
+    else:
+        print("Aucun match en direct. Recherche d'un match programmé.")
+        scheduled = get_fixtures("scheduled")
+        print("Matchs programmés :", len(scheduled))
 
-    for path in (
-        "/fixtures?status=live&per_page=100",
-        "/fixtures?status=scheduled&per_page=100",
-        "/fixtures?status=unknown&per_page=100",
-        "/fixtures?status=all&per_page=100",
-    ):
-        try:
-            results[path] = show_fixtures(path)
-        except Exception as error:
-            print(
-                "ÉCHEC DE LA REQUÊTE :",
-                path,
-                "|",
-                type(error).__name__,
-                str(error),
-            )
+        if scheduled:
+            fixture = scheduled[0]
+            print("Test des cotes sur un match programmé.")
 
-    live_path = "/fixtures?status=live&per_page=100"
-    live_count = len(results.get(live_path, []))
+    if not fixture:
+        print("Aucun match disponible pour tester les cotes.")
+        return
 
-    print("\n" + "=" * 50)
-    print("BILAN FINAL")
-    print("=" * 50)
-    print("Matchs live renvoyés par l'API :", live_count)
-    print("Matchs programmés :", len(results.get(
-        "/fixtures?status=scheduled&per_page=100", []
-    )))
-    print("Matchs inconnus :", len(results.get(
-        "/fixtures?status=unknown&per_page=100", []
-    )))
+    fixture_id = fixture.get("id")
+    teams = fixture.get("teams") or {}
+    home = (teams.get("home") or {}).get("name", "?")
+    away = (teams.get("away") or {}).get("name", "?")
+
+    print("Match :", home, "-", away)
+    print("ID du match :", fixture_id)
+
+    result = api_get(f"/fixtures/{fixture_id}/odds")
+    data = result.get("data", {})
+
+    if not isinstance(data, dict):
+        print("Format inattendu pour les cotes.")
+        return
+
+    bookmakers = data.get("bookmakers", [])
+    print("Nombre de bookmakers :", len(bookmakers))
+
+    for bookmaker in bookmakers:
+        if not isinstance(bookmaker, dict):
+            continue
+
+        print("\nBookmaker :", bookmaker.get("name", "?"))
+        odds = bookmaker.get("odds") or {}
+
+        if not isinstance(odds, dict):
+            continue
+
+        print("Marchés disponibles :", list(odds.keys()))
+
+        for market_name, market_data in odds.items():
+            if not isinstance(market_data, dict):
+                continue
+
+            print("Marché :", market_name)
+
+            for period in ("opening", "closing", "inplay"):
+                values = market_data.get(period)
+                if isinstance(values, dict):
+                    print(f"  {period} :", values)
+
+    print("\n=== FIN DU TEST ===")
     print("Aucune alerte de pari n'a été envoyée.")
-    print("Fin du diagnostic.")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        print("ERREUR FATALE :", type(error).__name__, str(error))
+        print("ERREUR :", type(error).__name__, str(error))
         sys.exit(1)
         
